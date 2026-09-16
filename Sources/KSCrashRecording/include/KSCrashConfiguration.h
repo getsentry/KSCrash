@@ -61,6 +61,15 @@ NS_ASSUME_NONNULL_BEGIN
  */
 @property(nonatomic, assign) KSCrashMonitorType monitors;
 
+/** Mach exceptions handled by the Mach exception monitor.
+ * A value of 0 is the empty exception set.
+ *
+ * This has no effect when the Mach exception monitor is disabled or unavailable.
+ *
+ * **Default**: `KSC_STANDARD_MACH_EXCEPTION_MASK`
+ */
+@property(nonatomic, assign) uint32_t machExceptionMask;
+
 /** Initial user-supplied data dictionary, written into the crash report's "user" section at install time.
  * Set to nil to clear.
  *

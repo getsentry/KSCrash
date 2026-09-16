@@ -25,6 +25,7 @@
 //
 
 #import <XCTest/XCTest.h>
+#import <mach/exception_types.h>
 #import <objc/runtime.h>
 #import "KSCrashConfiguration+Private.h"
 #import "KSCrashConfiguration.h"
@@ -32,6 +33,9 @@
 #define AssertAround(FLOAT_VALUE, COMPARED_TO)                          \
     XCTAssertGreaterThanOrEqual(FLOAT_VALUE, (COMPARED_TO) - 0.000001); \
     XCTAssertLessThanOrEqual(FLOAT_VALUE, (COMPARED_TO) + 0.000001)
+
+static const uint32_t kStandardMachExceptionMask =
+    EXC_MASK_BAD_ACCESS | EXC_MASK_BAD_INSTRUCTION | EXC_MASK_ARITHMETIC | EXC_MASK_SOFTWARE | EXC_MASK_BREAKPOINT;
 
 @interface KSCrashConfigurationTests : XCTestCase
 @end
@@ -52,6 +56,8 @@
     KSCrashConfiguration *config = [[KSCrashConfiguration alloc] init];
 
     XCTAssertEqual(config.monitors, KSCrashMonitorTypeProductionSafeMinimal);
+    XCTAssertEqual(config.machExceptionMask, kStandardMachExceptionMask);
+    XCTAssertEqual(KSCrashCConfiguration_Default().machExceptionMask, kStandardMachExceptionMask);
     XCTAssertNil(config.userInfoJSON);
     AssertAround(config.deadlockWatchdogInterval, 0.0);
     XCTAssertFalse(config.enableQueueNameSearch);
@@ -73,6 +79,7 @@
 {
     KSCrashConfiguration *config = [[KSCrashConfiguration alloc] init];
     config.monitors = KSCrashMonitorTypeDebuggerSafe;
+    config.machExceptionMask = 0x1234;
     config.userInfoJSON = @{ @"key" : @"value" };
     config.deadlockWatchdogInterval = 5.0;
     config.enableQueueNameSearch = YES;
@@ -90,6 +97,7 @@
     KSCrashCConfiguration cConfig = [config toCConfiguration];
 
     XCTAssertEqual(cConfig.monitors, KSCrashMonitorTypeDebuggerSafe);
+    XCTAssertEqual(cConfig.machExceptionMask, 0x1234u);
     XCTAssertTrue(cConfig.userInfoJSON != NULL);
     XCTAssertEqual(strcmp(cConfig.userInfoJSON, "{\"key\":\"value\"}"), 0);
     AssertAround(cConfig.deadlockWatchdogInterval, 5.0);
@@ -111,10 +119,22 @@
     KSCrashCConfiguration_Release(&cConfig);
 }
 
+- (void)testZeroMachExceptionMaskToCConfiguration
+{
+    KSCrashConfiguration *config = [[KSCrashConfiguration alloc] init];
+    config.machExceptionMask = 0;
+
+    KSCrashCConfiguration cConfig = [config toCConfiguration];
+
+    XCTAssertEqual(cConfig.machExceptionMask, 0u);
+    KSCrashCConfiguration_Release(&cConfig);
+}
+
 - (void)testCopyWithZone
 {
     KSCrashConfiguration *config = [[KSCrashConfiguration alloc] init];
     config.monitors = KSCrashMonitorTypeDebuggerSafe;
+    config.machExceptionMask = 0x1234;
     config.userInfoJSON = @{ @"key" : @"value" };
     config.deadlockWatchdogInterval = 5.0;
     config.enableQueueNameSearch = YES;
@@ -132,6 +152,7 @@
     KSCrashConfiguration *copy = [config copy];
 
     XCTAssertEqual(copy.monitors, KSCrashMonitorTypeDebuggerSafe);
+    XCTAssertEqual(copy.machExceptionMask, 0x1234u);
     XCTAssertEqualObjects(copy.userInfoJSON, @{ @"key" : @"value" });
     AssertAround(copy.deadlockWatchdogInterval, 5.0);
     XCTAssertTrue(copy.enableQueueNameSearch);

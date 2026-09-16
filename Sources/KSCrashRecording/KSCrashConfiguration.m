@@ -39,6 +39,7 @@
         KSCrashCConfiguration cConfig = KSCrashCConfiguration_Default();
         _installPath = nil;
         _monitors = cConfig.monitors;
+        _machExceptionMask = cConfig.machExceptionMask;
 
         if (cConfig.userInfoJSON != NULL) {
             NSData *data = [NSData dataWithBytes:cConfig.userInfoJSON length:strlen(cConfig.userInfoJSON)];
@@ -100,6 +101,7 @@
 
     config.reportStoreConfiguration = [self.reportStoreConfiguration toCConfiguration];
     config.monitors = self.monitors;
+    config.machExceptionMask = self.machExceptionMask;
     config.userInfoJSON = self.userInfoJSON ? [self jsonStringFromDictionary:self.userInfoJSON] : NULL;
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
@@ -193,6 +195,7 @@
 
     copy.installPath = [self.installPath copyWithZone:zone];
     copy.monitors = self.monitors;
+    copy.machExceptionMask = self.machExceptionMask;
     copy.userInfoJSON = [self.userInfoJSON copyWithZone:zone];
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"

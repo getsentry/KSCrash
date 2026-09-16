@@ -43,6 +43,9 @@
 extern "C" {
 #endif
 
+/** KSCrash's standard Mach exception mask: bad access, bad instruction, arithmetic, software, and breakpoint. */
+#define KSC_STANDARD_MACH_EXCEPTION_MASK ((uint32_t)0x6e)
+
 /** Configuration for managing crash reports through the report store API.
  */
 typedef struct {
@@ -362,6 +365,15 @@ typedef struct {
      * **Default**: false
      */
     bool enableSwiftAsyncStackTraces;
+
+    /** Mach exceptions handled by the Mach exception monitor.
+     * A value of 0 is the empty exception set.
+     *
+     * This has no effect when the Mach exception monitor is disabled or unavailable.
+     *
+     * **Default**: `KSC_STANDARD_MACH_EXCEPTION_MASK`
+     */
+    uint32_t machExceptionMask;
 } KSCrashCConfiguration;
 
 static inline KSCrashCConfiguration KSCrashCConfiguration_Default(void)
@@ -369,6 +381,7 @@ static inline KSCrashCConfiguration KSCrashCConfiguration_Default(void)
     return (KSCrashCConfiguration) {
         .reportStoreConfiguration = KSCrashReportStoreCConfiguration_Default(),
         .monitors = KSCrashMonitorTypeProductionSafeMinimal,
+        .machExceptionMask = KSC_STANDARD_MACH_EXCEPTION_MASK,
         .userInfoJSON = NULL,
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"

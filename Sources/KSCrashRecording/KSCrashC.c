@@ -496,6 +496,7 @@ KSCrashInstallErrorCode kscrash_install(const char *appName, const char *const i
     kscm_setEventCallbackWithResult(onExceptionEvent);
     kscm_setFinalizeReportCallback(onFinalizeReport);
 
+    kscm_machexception_setExceptionMask(configuration->machExceptionMask);
     setMonitors(configuration->monitors);
     setPluginMonitors(configuration->plugins.apis, configuration->plugins.length);
 
