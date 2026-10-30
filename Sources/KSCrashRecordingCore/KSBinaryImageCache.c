@@ -36,8 +36,10 @@
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "KSLogger.h"
+#include "KSMemory.h"
 #include "KSPlatformSpecificDefines.h"
 
 // MARK: - Image Address Range Cache
@@ -165,6 +167,260 @@ static void insertSortedCacheEntry(KSBinaryImageRangeCache *cache, const KSBinar
 
     cache->entries[left] = *entry;
     cache->count++;
+}
+
+// MARK: - Shared 64-bit Mach-O load-command walker
+
+// Optional named-section lookup performed during a walk. Found addresses are returned slid
+// (runtime addresses in the walked image's address space).
+typedef struct {
+    const char *segName;
+    const char *sectName;
+    uintptr_t addr;  // out: runtime (slid) address, 0 if not found
+    uintptr_t size;  // out: section size, 0 if not found
+    bool found;      // out
+} KSMachOSectionQuery;
+
+// Geometry recovered from one image's load commands. Runtime addresses (segments, queries,
+// startAddress, endAddress) are slid; the fields explicitly documented as unslid below
+// (textVMAddr, segmentBase) are raw link-time values and callers apply the slide themselves.
+typedef struct {
+    uintptr_t slide;
+    uintptr_t textSize;      // __TEXT vmsize: the size in-process reports record for an image
+    uint64_t textVMAddr;     // __TEXT vmaddr, UNSLID: what reports record as image_vmaddr, and
+                             // what symbolication subtracts from the load address to get the slide
+    uint64_t dylibVersion;   // LC_ID_DYLIB current_version, 0 if absent (packed major/minor/revision)
+    uintptr_t segmentBase;   // UNSLID vmaddr - fileoff of __LINKEDIT (for symbol lookups), 0 if absent
+    uintptr_t startAddress;  // min segment start, 0 if no segments
+    uintptr_t endAddress;    // max segment end, 0 if no segments
+    KSSegmentRange segments[KSBIC_MAX_SEGMENTS_PER_IMAGE];
+    uint8_t segmentCount;
+    const uint8_t *uuid;  // LC_UUID bytes pointing INTO the walked buffer, NULL if absent.
+                          // Only valid as long as the walked buffer is; do not keep it when
+                          // walking a temporary copy of a remote task's load commands.
+} KSMachOImageGeometry;
+
+// Walk a 64-bit Mach-O load-command region. `cmds` is either the live in-process region or a
+// copy of a remote task's; every offset is bounds-checked against `sizeofcmds` because remote
+// bytes come from a crashed (possibly memory-smashed) process and cannot be trusted.
+// Async-signal-safe (no allocation, no libc beyond strncmp).
+static void walkLoadCommands64(const uint8_t *cmds, uint32_t sizeofcmds, uint32_t ncmds, uintptr_t loadAddress,
+                               KSMachOSectionQuery *queries, uint32_t queryCount, KSMachOImageGeometry *outGeometry)
+{
+    memset(outGeometry, 0, sizeof(*outGeometry));
+
+    uintptr_t minAddr = UINTPTR_MAX;
+    uintptr_t maxAddr = 0;
+    bool foundText = false;
+    bool foundLinkedit = false;
+
+    // Walk via uintptr_t (not uint8_t *) so casts to load_command/segment structs don't trip
+    // -Wcast-align.
+    uintptr_t cmdPtr = (uintptr_t)cmds;
+    const uintptr_t cmdsEnd = cmdPtr + sizeofcmds;
+    for (uint32_t i = 0; i < ncmds; i++) {
+        if (cmdPtr + sizeof(struct load_command) > cmdsEnd) {
+            break;
+        }
+        const struct load_command *lc = (const struct load_command *)cmdPtr;
+        if (lc->cmdsize < sizeof(struct load_command) || cmdPtr + lc->cmdsize > cmdsEnd) {
+            break;
+        }
+        // 64-bit load commands are 8-byte aligned. Magnitude alone is not enough: an unaligned
+        // cmdsize leaves every later cmdPtr misaligned, and the struct casts below then load
+        // 64-bit fields from an odd address (UB, and a trap under -fsanitize=alignment).
+        if (lc->cmdsize % 8 != 0) {
+            break;
+        }
+
+        if (lc->cmd == LC_SEGMENT_64 && lc->cmdsize >= sizeof(struct segment_command_64)) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)cmdPtr;
+
+            // __TEXT gives the slide, which converts vmaddrs to runtime addresses, and its
+            // vmsize is the image size in-process reports record.
+            if (!foundText && strncmp(seg->segname, SEG_TEXT, sizeof(seg->segname)) == 0) {
+                outGeometry->slide = loadAddress - (uintptr_t)seg->vmaddr;
+                outGeometry->textSize = (uintptr_t)seg->vmsize;
+                outGeometry->textVMAddr = seg->vmaddr;
+                foundText = true;
+            }
+
+            // __LINKEDIT gives the segment base for symbol lookups.
+            if (!foundLinkedit && strncmp(seg->segname, SEG_LINKEDIT, sizeof(seg->segname)) == 0) {
+                outGeometry->segmentBase = (uintptr_t)(seg->vmaddr - seg->fileoff);
+                foundLinkedit = true;
+            }
+
+            // Match named sections inside this segment. nsects is untrusted (remote bytes),
+            // so the bound is checked in integer space before any pointer arithmetic uses it
+            // (sects + nsects on a hostile count would be out-of-bounds arithmetic, formal UB).
+            if (queryCount > 0) {
+                const struct section_64 *sects =
+                    (const struct section_64 *)(cmdPtr + sizeof(struct segment_command_64));
+                if ((uint64_t)seg->nsects * sizeof(struct section_64) <=
+                    lc->cmdsize - sizeof(struct segment_command_64)) {
+                    for (uint32_t q = 0; q < queryCount; q++) {
+                        if (queries[q].found || strncmp(seg->segname, queries[q].segName, sizeof(seg->segname)) != 0) {
+                            continue;
+                        }
+                        for (uint32_t s = 0; s < seg->nsects; s++) {
+                            if (strncmp(sects[s].sectname, queries[q].sectName, sizeof(sects[s].sectname)) == 0) {
+                                queries[q].addr = (uintptr_t)sects[s].addr;  // slid after the loop
+                                queries[q].size = (uintptr_t)sects[s].size;
+                                queries[q].found = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Store segments with actual file content (exclude __PAGEZERO)
+            if (seg->vmsize > 0 && seg->filesize > 0) {
+                uintptr_t segStart = (uintptr_t)seg->vmaddr;
+                uintptr_t segEnd = segStart + (uintptr_t)seg->vmsize;
+                if (segStart < minAddr) minAddr = segStart;
+                if (segEnd > maxAddr) maxAddr = segEnd;
+                if (outGeometry->segmentCount < KSBIC_MAX_SEGMENTS_PER_IMAGE) {
+                    outGeometry->segments[outGeometry->segmentCount].start = segStart;
+                    outGeometry->segments[outGeometry->segmentCount].end = segEnd;
+                    outGeometry->segmentCount++;
+                }
+            }
+        }
+        if (lc->cmd == LC_UUID && lc->cmdsize >= sizeof(struct uuid_command)) {
+            const struct uuid_command *ucmd = (const struct uuid_command *)cmdPtr;
+            outGeometry->uuid = ucmd->uuid;
+        }
+        // LC_ID_DYLIB carries the version triple reports record for the image.
+        if (lc->cmd == LC_ID_DYLIB && lc->cmdsize >= sizeof(struct dylib_command)) {
+            const struct dylib_command *dcmd = (const struct dylib_command *)cmdPtr;
+            outGeometry->dylibVersion = dcmd->dylib.current_version;
+        }
+        cmdPtr += lc->cmdsize;
+    }
+
+    // Apply the slide now that __TEXT has been seen.
+    const uintptr_t slide = outGeometry->slide;
+    for (uint8_t i = 0; i < outGeometry->segmentCount; i++) {
+        outGeometry->segments[i].start += slide;
+        outGeometry->segments[i].end += slide;
+    }
+    for (uint32_t q = 0; q < queryCount; q++) {
+        if (queries[q].found) {
+            queries[q].addr += slide;
+        }
+    }
+    outGeometry->startAddress = (minAddr == UINTPTR_MAX) ? 0 : (minAddr + slide);
+    outGeometry->endAddress = (maxAddr == 0) ? 0 : (maxAddr + slide);
+}
+
+// The 32-bit sibling of walkLoadCommands64, for MH_MAGIC images (arm64_32 on watchOS).
+// Keep the two in lockstep: same bounds discipline, same geometry, same query handling.
+// Async-signal-safe (no allocation, no libc beyond strncmp).
+static void walkLoadCommands32(const uint8_t *cmds, uint32_t sizeofcmds, uint32_t ncmds, uintptr_t loadAddress,
+                               KSMachOSectionQuery *queries, uint32_t queryCount, KSMachOImageGeometry *outGeometry)
+{
+    memset(outGeometry, 0, sizeof(*outGeometry));
+
+    uintptr_t minAddr = UINTPTR_MAX;
+    uintptr_t maxAddr = 0;
+    bool foundText = false;
+    bool foundLinkedit = false;
+
+    uintptr_t cmdPtr = (uintptr_t)cmds;
+    const uintptr_t cmdsEnd = cmdPtr + sizeofcmds;
+    for (uint32_t i = 0; i < ncmds; i++) {
+        if (cmdPtr + sizeof(struct load_command) > cmdsEnd) {
+            break;
+        }
+        const struct load_command *lc = (const struct load_command *)cmdPtr;
+        if (lc->cmdsize < sizeof(struct load_command) || cmdPtr + lc->cmdsize > cmdsEnd) {
+            break;
+        }
+        // 32-bit load commands are 4-byte aligned; see the 64-bit walker for why magnitude
+        // alone is not enough.
+        if (lc->cmdsize % 4 != 0) {
+            break;
+        }
+
+        if (lc->cmd == LC_SEGMENT && lc->cmdsize >= sizeof(struct segment_command)) {
+            const struct segment_command *seg = (const struct segment_command *)cmdPtr;
+
+            // __TEXT gives the slide, which converts vmaddrs to runtime addresses, and its
+            // vmsize is the image size in-process reports record.
+            if (!foundText && strncmp(seg->segname, SEG_TEXT, sizeof(seg->segname)) == 0) {
+                outGeometry->slide = loadAddress - (uintptr_t)seg->vmaddr;
+                outGeometry->textSize = (uintptr_t)seg->vmsize;
+                outGeometry->textVMAddr = seg->vmaddr;
+                foundText = true;
+            }
+
+            // __LINKEDIT gives the segment base for symbol lookups.
+            if (!foundLinkedit && strncmp(seg->segname, SEG_LINKEDIT, sizeof(seg->segname)) == 0) {
+                outGeometry->segmentBase = (uintptr_t)(seg->vmaddr - seg->fileoff);
+                foundLinkedit = true;
+            }
+
+            // Match named sections inside this segment; nsects is untrusted, same as the
+            // 64-bit walker.
+            if (queryCount > 0) {
+                const struct section *sects = (const struct section *)(cmdPtr + sizeof(struct segment_command));
+                if ((uint64_t)seg->nsects * sizeof(struct section) <= lc->cmdsize - sizeof(struct segment_command)) {
+                    for (uint32_t q = 0; q < queryCount; q++) {
+                        if (queries[q].found || strncmp(seg->segname, queries[q].segName, sizeof(seg->segname)) != 0) {
+                            continue;
+                        }
+                        for (uint32_t s = 0; s < seg->nsects; s++) {
+                            if (strncmp(sects[s].sectname, queries[q].sectName, sizeof(sects[s].sectname)) == 0) {
+                                queries[q].addr = (uintptr_t)sects[s].addr;  // slid after the loop
+                                queries[q].size = (uintptr_t)sects[s].size;
+                                queries[q].found = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Store segments with actual file content (exclude __PAGEZERO)
+            if (seg->vmsize > 0 && seg->filesize > 0) {
+                uintptr_t segStart = (uintptr_t)seg->vmaddr;
+                uintptr_t segEnd = segStart + (uintptr_t)seg->vmsize;
+                if (segStart < minAddr) minAddr = segStart;
+                if (segEnd > maxAddr) maxAddr = segEnd;
+                if (outGeometry->segmentCount < KSBIC_MAX_SEGMENTS_PER_IMAGE) {
+                    outGeometry->segments[outGeometry->segmentCount].start = segStart;
+                    outGeometry->segments[outGeometry->segmentCount].end = segEnd;
+                    outGeometry->segmentCount++;
+                }
+            }
+        }
+        if (lc->cmd == LC_UUID && lc->cmdsize >= sizeof(struct uuid_command)) {
+            const struct uuid_command *ucmd = (const struct uuid_command *)cmdPtr;
+            outGeometry->uuid = ucmd->uuid;
+        }
+        // LC_ID_DYLIB carries the version triple reports record for the image.
+        if (lc->cmd == LC_ID_DYLIB && lc->cmdsize >= sizeof(struct dylib_command)) {
+            const struct dylib_command *dcmd = (const struct dylib_command *)cmdPtr;
+            outGeometry->dylibVersion = dcmd->dylib.current_version;
+        }
+        cmdPtr += lc->cmdsize;
+    }
+
+    // Apply the slide now that __TEXT has been seen.
+    const uintptr_t slide = outGeometry->slide;
+    for (uint8_t i = 0; i < outGeometry->segmentCount; i++) {
+        outGeometry->segments[i].start += slide;
+        outGeometry->segments[i].end += slide;
+    }
+    for (uint32_t q = 0; q < queryCount; q++) {
+        if (queries[q].found) {
+            queries[q].addr += slide;
+        }
+    }
+    outGeometry->startAddress = (minAddr == UINTPTR_MAX) ? 0 : (minAddr + slide);
+    outGeometry->endAddress = (maxAddr == 0) ? 0 : (maxAddr + slide);
 }
 
 intptr_t ksbic_getImageSlide(const struct mach_header *header)
@@ -866,4 +1122,82 @@ const uint8_t *ksbic_getUUIDForHeader(const struct mach_header *header)
         }
         return NULL;
     }
+}
+
+// MARK: - Owned image metadata
+
+// Copy a Mach-O header of either width and its load commands out of `task`. Returns the malloc'd
+// load-command buffer (caller frees) or NULL when the header cannot be read, its magic is unknown,
+// or its sizes are implausible. Every read goes through vm_read_overwrite, so an image unmapped
+// underneath us (a concurrent final dlclose) yields NULL instead of a fault.
+static uint8_t *copyLoadCommandsFromTask(task_t task, uintptr_t loadAddress, struct mach_header_64 *outHeader)
+{
+    // Read only the common prefix first: a 32-bit header is shorter than mach_header_64.
+    memset(outHeader, 0, sizeof(*outHeader));
+    if (!ksmem_copySafelyFromTask(task, (const void *)loadAddress, outHeader, sizeof(struct mach_header))) {
+        return NULL;
+    }
+    uintptr_t headerSize;
+    if (outHeader->magic == MH_MAGIC_64) {
+        headerSize = sizeof(struct mach_header_64);
+    } else if (outHeader->magic == MH_MAGIC) {
+        headerSize = sizeof(struct mach_header);
+    } else {
+        return NULL;
+    }
+
+    // Sanity-bound the load-command region before allocating, in case the header is garbage.
+    const uint32_t maxCmdsSize = 1u << 20;  // 1 MiB; real load-command regions are a few KiB.
+    if (outHeader->sizeofcmds == 0 || outHeader->sizeofcmds > maxCmdsSize) {
+        return NULL;
+    }
+    uint8_t *cmds = malloc(outHeader->sizeofcmds);
+    if (cmds == NULL) {
+        return NULL;
+    }
+    if (!ksmem_copySafelyFromTask(task, (const void *)(loadAddress + headerSize), cmds, (int)outHeader->sizeofcmds)) {
+        free(cmds);
+        return NULL;
+    }
+    return cmds;
+}
+
+bool ksbic_copyTaskImage(task_t task, uintptr_t loadAddress, KSBinaryImage *outImage, uint8_t *outUUID)
+{
+    if (outImage == NULL || outUUID == NULL) {
+        return false;
+    }
+    struct mach_header_64 header;
+    uint8_t *cmds = copyLoadCommandsFromTask(task, loadAddress, &header);
+    if (cmds == NULL) {
+        return false;
+    }
+    KSMachOImageGeometry geometry;
+    if (header.magic == MH_MAGIC_64) {
+        walkLoadCommands64(cmds, header.sizeofcmds, header.ncmds, loadAddress, NULL, 0, &geometry);
+    } else {
+        walkLoadCommands32(cmds, header.sizeofcmds, header.ncmds, loadAddress, NULL, 0, &geometry);
+    }
+    // geometry.uuid points into cmds; copy it out before the buffer goes away.
+    const bool hasUUID = geometry.uuid != NULL;
+    if (hasUUID) {
+        memcpy(outUUID, geometry.uuid, 16);
+    }
+    free(cmds);
+    if (geometry.textSize == 0) {
+        return false;
+    }
+
+    // Same values ksdl_binaryImageForHeader records for a live local image.
+    outImage->address = loadAddress;
+    outImage->vmAddress = geometry.textVMAddr;
+    outImage->vmAddressSlide = (uint64_t)geometry.slide;
+    outImage->size = geometry.textSize;
+    outImage->uuid = hasUUID ? outUUID : NULL;
+    outImage->cpuType = header.cputype;
+    outImage->cpuSubType = header.cpusubtype;
+    outImage->majorVersion = geometry.dylibVersion >> 16;
+    outImage->minorVersion = (geometry.dylibVersion >> 8) & 0xff;
+    outImage->revisionVersion = geometry.dylibVersion & 0xff;
+    return true;
 }

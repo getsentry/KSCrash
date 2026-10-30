@@ -811,4 +811,49 @@ extern void ksbic_testcode_setMaxCacheEntries(uint32_t maxEntries);
     }
 }
 
+- (void)testCopyTaskImage_MatchesLiveExtractionForEveryLoadedImage
+{
+    uint32_t count = _dyld_image_count();
+    XCTAssertGreaterThan(count, 0u);
+    for (uint32_t i = 0; i < count; i++) {
+        const struct mach_header *header = _dyld_get_image_header(i);
+        KSBinaryImage live = { 0 };
+        if (header == NULL || !ksdl_binaryImageForHeader(header, _dyld_get_image_name(i), &live)) {
+            continue;
+        }
+
+        KSBinaryImage copied = { 0 };
+        uint8_t uuid[16] = { 0 };
+        XCTAssertTrue(ksbic_copyTaskImage(mach_task_self(), (uintptr_t)header, &copied, uuid), @"%s",
+                      _dyld_get_image_name(i));
+        XCTAssertEqual(copied.address, live.address);
+        XCTAssertEqual(copied.vmAddress, live.vmAddress);
+        XCTAssertEqual(copied.vmAddressSlide, live.vmAddressSlide);
+        XCTAssertEqual(copied.size, live.size);
+        XCTAssertEqual(copied.cpuType, live.cpuType);
+        XCTAssertEqual(copied.cpuSubType, live.cpuSubType);
+        XCTAssertEqual(copied.majorVersion, live.majorVersion);
+        XCTAssertEqual(copied.minorVersion, live.minorVersion);
+        XCTAssertEqual(copied.revisionVersion, live.revisionVersion);
+        if (live.uuid == NULL) {
+            XCTAssertTrue(copied.uuid == NULL);
+        } else {
+            XCTAssertTrue(copied.uuid == uuid);
+            XCTAssertEqual(memcmp(uuid, live.uuid, sizeof(uuid)), 0);
+        }
+    }
+}
+
+- (void)testCopyTaskImage_ReturnsFalseForUnmappedMemory
+{
+    // A page that was mapped and released stands in for an image whose final dlclose already ran.
+    vm_address_t page = 0;
+    XCTAssertEqual(vm_allocate(mach_task_self(), &page, vm_page_size, VM_FLAGS_ANYWHERE), KERN_SUCCESS);
+    XCTAssertEqual(vm_deallocate(mach_task_self(), page, vm_page_size), KERN_SUCCESS);
+
+    KSBinaryImage image = { 0 };
+    uint8_t uuid[16] = { 0 };
+    XCTAssertFalse(ksbic_copyTaskImage(mach_task_self(), (uintptr_t)page, &image, uuid));
+}
+
 @end

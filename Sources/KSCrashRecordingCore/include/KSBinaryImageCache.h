@@ -28,6 +28,7 @@
 #define HDR_KSBinaryImageCache_h
 
 #include <mach-o/dyld.h>
+#include <mach/mach_types.h>
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -37,6 +38,7 @@
 #pragma clang diagnostic pop
 
 #include "KSCrashNamespace.h"
+#include "KSDynamicLinker.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -205,6 +207,29 @@ bool ksbic_getUnwindInfoForHeader(const struct mach_header *_Nullable header,
  * @return true if the image was found, false otherwise.
  */
 bool ksbic_getUnwindInfoForAddress(uintptr_t address, KSBinaryImageUnwindInfo *_Nullable outInfo);
+
+/**
+ * Fill a @c KSBinaryImage from an image of @c task using only safe copies of its header and load
+ * commands, so the result stays valid after the image is unloaded.
+ *
+ * Every read of the image goes through @c vm_read_overwrite. An image that is unmapped before or
+ * during the call yields @c false; the call never faults on it.
+ *
+ * Sets address, vmAddress, vmAddressSlide, size, cpuType, cpuSubType and the version triple, with
+ * the values @c ksdl_binaryImageForHeader records for a live image. Copies the LC_UUID into
+ * @c outUUID and points @c outImage->uuid at it, or sets @c outImage->uuid to NULL when the
+ * image has none. name and the crash-info strings are left untouched.
+ *
+ * Allocates; not async-signal-safe.
+ *
+ * @param task The task whose image to inspect; @c mach_task_self() for the current process.
+ * @param loadAddress The image's load address in @c task.
+ * @param outImage The image to fill. Must not be NULL.
+ * @param outUUID Caller-owned storage for 16 UUID bytes. Must not be NULL.
+ * @return true if the header and load commands were read and carried a __TEXT segment.
+ */
+bool ksbic_copyTaskImage(task_t task, uintptr_t loadAddress, KSBinaryImage *_Nonnull outImage,
+                         uint8_t *_Nonnull outUUID);
 
 #ifdef __cplusplus
 }
