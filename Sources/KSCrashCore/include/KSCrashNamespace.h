@@ -182,6 +182,7 @@
 #define ks_spinlock_unlock KSCRASH_NS(ks_spinlock_unlock)
 #define ksapp_transitionStateIsUserPerceptible KSCRASH_NS(ksapp_transitionStateIsUserPerceptible)
 #define ksapp_transitionStateToString KSCRASH_NS(ksapp_transitionStateToString)
+#define ksbic_copyTaskImage KSCRASH_NS(ksbic_copyTaskImage)
 #define ksbic_findImageForAddress KSCRASH_NS(ksbic_findImageForAddress)
 #define ksbic_getAppHeader KSCRASH_NS(ksbic_getAppHeader)
 #define ksbic_getDyldHeader KSCRASH_NS(ksbic_getDyldHeader)

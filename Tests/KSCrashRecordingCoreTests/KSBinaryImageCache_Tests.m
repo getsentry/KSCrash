@@ -28,6 +28,7 @@
 #import <dlfcn.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
+#import <mach/mach.h>
 
 #import "KSBinaryImageCache.h"
 #import "KSDynamicLinker.h"
@@ -42,6 +43,50 @@ static void testImageAddedCallback(const struct mach_header *mh, intptr_t vmaddr
     g_lastCallbackHeader = mh;
     g_lastCallbackSlide = vmaddr_slide;
     g_callbackCount++;
+}
+
+// No dyld registration: these fixtures exercise owned extraction without changing the process list.
+static size_t populateOwnedImageFixture(uint8_t *bytes, bool is64Bit)
+{
+    const size_t headerSize = is64Bit ? sizeof(struct mach_header_64) : sizeof(struct mach_header);
+    const size_t textSize = is64Bit ? sizeof(struct segment_command_64) : sizeof(struct segment_command);
+    struct mach_header_64 header = {
+        .magic = is64Bit ? MH_MAGIC_64 : MH_MAGIC,
+        .cputype = is64Bit ? CPU_TYPE_ARM64 : CPU_TYPE_ARM64_32,
+        .cpusubtype = 1,
+        .filetype = MH_DYLIB,
+        .ncmds = 3,
+        .sizeofcmds = (uint32_t)(textSize + sizeof(struct uuid_command) + sizeof(struct dylib_command)),
+    };
+    memcpy(bytes, &header, headerSize);
+    if (is64Bit) {
+        struct segment_command_64 text = {
+            .cmd = LC_SEGMENT_64,
+            .cmdsize = sizeof(text),
+            .segname = SEG_TEXT,
+            .vmaddr = 0x1000,
+            .vmsize = 0x4000,
+            .filesize = 0x4000,
+        };
+        memcpy(bytes + headerSize, &text, sizeof(text));
+    } else {
+        struct segment_command text = {
+            .cmd = LC_SEGMENT,
+            .cmdsize = sizeof(text),
+            .segname = SEG_TEXT,
+            .vmaddr = 0x1000,
+            .vmsize = 0x4000,
+            .filesize = 0x4000,
+        };
+        memcpy(bytes + headerSize, &text, sizeof(text));
+    }
+    struct uuid_command uuid = { .cmd = LC_UUID, .cmdsize = sizeof(uuid) };
+    memset(uuid.uuid, 0x42, sizeof(uuid.uuid));
+    memcpy(bytes + headerSize + textSize, &uuid, sizeof(uuid));
+    struct dylib_command dylib = { .cmd = LC_ID_DYLIB, .cmdsize = sizeof(dylib) };
+    dylib.dylib.current_version = 0x00020304;
+    memcpy(bytes + headerSize + textSize + sizeof(uuid), &dylib, sizeof(dylib));
+    return headerSize + header.sizeofcmds;
 }
 
 @interface KSBinaryImageCache_Tests : XCTestCase
@@ -809,6 +854,192 @@ extern void ksbic_testcode_setMaxCacheEntries(uint32_t maxEntries);
         ksbic_init();
 #pragma clang diagnostic pop
     }
+}
+
+- (void)testCopyTaskImage_MatchesLiveExtractionForEveryLoadedImage
+{
+    uint32_t count = _dyld_image_count();
+    XCTAssertGreaterThan(count, 0u);
+    for (uint32_t i = 0; i < count; i++) {
+        const struct mach_header *header = _dyld_get_image_header(i);
+        KSBinaryImage live = { 0 };
+        if (header == NULL || !ksdl_binaryImageForHeader(header, _dyld_get_image_name(i), &live)) {
+            continue;
+        }
+
+        KSBinaryImage copied = { 0 };
+        uint8_t uuid[16] = { 0 };
+        XCTAssertTrue(ksbic_copyTaskImage(mach_task_self(), (uintptr_t)header, &copied, uuid), @"%s",
+                      _dyld_get_image_name(i));
+        XCTAssertEqual(copied.address, live.address);
+        XCTAssertEqual(copied.vmAddress, live.vmAddress);
+        XCTAssertEqual(copied.vmAddressSlide, live.vmAddressSlide);
+        XCTAssertEqual(copied.size, live.size);
+        XCTAssertEqual(copied.cpuType, live.cpuType);
+        XCTAssertEqual(copied.cpuSubType, live.cpuSubType);
+        XCTAssertEqual(copied.majorVersion, live.majorVersion);
+        XCTAssertEqual(copied.minorVersion, live.minorVersion);
+        XCTAssertEqual(copied.revisionVersion, live.revisionVersion);
+        if (live.uuid == NULL) {
+            XCTAssertTrue(copied.uuid == NULL);
+        } else {
+            XCTAssertTrue(copied.uuid == uuid);
+            XCTAssertEqual(memcmp(uuid, live.uuid, sizeof(uuid)), 0);
+        }
+    }
+}
+
+- (void)testCopyTaskImage_OwnsMetadataForBothHeaderWidths
+{
+    for (int is64Bit = 0; is64Bit <= 1; is64Bit++) {
+        vm_address_t page = 0;
+        kern_return_t result = vm_allocate(mach_task_self(), &page, vm_page_size, VM_FLAGS_ANYWHERE);
+        XCTAssertEqual(result, KERN_SUCCESS);
+        if (result != KERN_SUCCESS) return;
+        populateOwnedImageFixture((uint8_t *)page, is64Bit);
+
+        KSBinaryImage image = { .name = "untouched name", .crashInfoMessage = "untouched crash info" };
+        uint8_t uuid[16] = { 0 };
+        bool copied = ksbic_copyTaskImage(mach_task_self(), page, &image, uuid);
+        XCTAssertEqual(vm_deallocate(mach_task_self(), page, vm_page_size), KERN_SUCCESS);
+
+        // Nothing in the extracted fields may still depend on the fixture or temporary parser buffer.
+        XCTAssertTrue(copied);
+        XCTAssertEqual(image.address, page);
+        XCTAssertEqual(image.vmAddress, 0x1000u);
+        XCTAssertEqual(image.vmAddressSlide, (uint64_t)(uintptr_t)(page - 0x1000));
+        XCTAssertEqual(image.size, 0x4000u);
+        XCTAssertEqual(image.cpuType, is64Bit ? CPU_TYPE_ARM64 : CPU_TYPE_ARM64_32);
+        XCTAssertEqual(image.cpuSubType, 1);
+        XCTAssertEqual(image.majorVersion, 2u);
+        XCTAssertEqual(image.minorVersion, 3u);
+        XCTAssertEqual(image.revisionVersion, 4u);
+        XCTAssertTrue(image.uuid == uuid);
+        uint8_t expectedUUID[16];
+        memset(expectedUUID, 0x42, sizeof(expectedUUID));
+        XCTAssertEqual(memcmp(uuid, expectedUUID, sizeof(uuid)), 0);
+        XCTAssertEqual(strcmp(image.name, "untouched name"), 0);
+        XCTAssertEqual(strcmp(image.crashInfoMessage, "untouched crash info"), 0);
+    }
+}
+
+- (void)testCopyTaskImage_RejectsInvalidHeadersAndCommandSizes
+{
+    union {
+        struct mach_header_64 header;
+        uint8_t bytes[256];
+    } storage;
+    KSBinaryImage image = { 0 };
+    uint8_t uuid[16];
+    for (int is64Bit = 0; is64Bit <= 1; is64Bit++) {
+        populateOwnedImageFixture(storage.bytes, is64Bit);
+        storage.header.magic = 0;
+        XCTAssertFalse(ksbic_copyTaskImage(mach_task_self(), (uintptr_t)storage.bytes, &image, uuid));
+
+        const uint32_t invalidSizes[] = { 0, (1u << 20) + 1, UINT32_MAX };
+        for (size_t i = 0; i < sizeof(invalidSizes) / sizeof(invalidSizes[0]); i++) {
+            populateOwnedImageFixture(storage.bytes, is64Bit);
+            storage.header.sizeofcmds = invalidSizes[i];
+            XCTAssertFalse(ksbic_copyTaskImage(mach_task_self(), (uintptr_t)storage.bytes, &image, uuid));
+        }
+
+        const uint32_t invalidCommandSizes[] = { 0, 4, 9, UINT32_MAX - 7 };
+        for (size_t i = 0; i < sizeof(invalidCommandSizes) / sizeof(invalidCommandSizes[0]); i++) {
+            populateOwnedImageFixture(storage.bytes, is64Bit);
+            size_t headerSize = is64Bit ? sizeof(struct mach_header_64) : sizeof(struct mach_header);
+            struct load_command *command = (struct load_command *)(uintptr_t)(storage.bytes + headerSize);
+            // The last size is aligned but would wrap pointer addition on arm64_32.
+            command->cmdsize = invalidCommandSizes[i];
+            XCTAssertFalse(ksbic_copyTaskImage(mach_task_self(), (uintptr_t)storage.bytes, &image, uuid));
+        }
+    }
+}
+
+- (void)testCopyTaskImage_HugeCommandCountStopsAtCopiedExtent
+{
+    union {
+        struct mach_header_64 header;
+        uint8_t bytes[256];
+    } storage;
+    for (int is64Bit = 0; is64Bit <= 1; is64Bit++) {
+        populateOwnedImageFixture(storage.bytes, is64Bit);
+        storage.header.ncmds = UINT32_MAX;
+        KSBinaryImage image = { 0 };
+        uint8_t uuid[16];
+        // Best-effort extraction of the valid copied commands, not UINT32_MAX iterations.
+        XCTAssertTrue(ksbic_copyTaskImage(mach_task_self(), (uintptr_t)storage.bytes, &image, uuid));
+        XCTAssertEqual(image.size, 0x4000u);
+        XCTAssertTrue(image.uuid == uuid);
+    }
+}
+
+- (void)testCopyTaskImage_SkipsTruncatedUUID
+{
+    union {
+        struct mach_header_64 header;
+        uint8_t bytes[256];
+    } storage;
+    for (int is64Bit = 0; is64Bit <= 1; is64Bit++) {
+        populateOwnedImageFixture(storage.bytes, is64Bit);
+        size_t textSize = is64Bit ? sizeof(struct segment_command_64) : sizeof(struct segment_command);
+        storage.header.sizeofcmds = (uint32_t)(textSize + sizeof(struct load_command));
+        KSBinaryImage image = { 0 };
+        uint8_t uuid[16];
+        // A complete __TEXT remains useful, but the incomplete UUID must not be read out of bounds.
+        XCTAssertTrue(ksbic_copyTaskImage(mach_task_self(), (uintptr_t)storage.bytes, &image, uuid));
+        XCTAssertEqual(image.size, 0x4000u);
+        XCTAssertTrue(image.uuid == NULL);
+    }
+}
+
+- (void)testCopyTaskImage_ReturnsFalseForPartiallyReadableInput
+{
+    vm_address_t pages = 0;
+    kern_return_t result = vm_allocate(mach_task_self(), &pages, 2 * vm_page_size, VM_FLAGS_ANYWHERE);
+    XCTAssertEqual(result, KERN_SUCCESS);
+    if (result != KERN_SUCCESS) return;
+    @try {
+        uint8_t fixture[256];
+        for (int is64Bit = 0; is64Bit <= 1; is64Bit++) {
+            size_t fixtureSize = populateOwnedImageFixture(fixture, is64Bit);
+            const size_t readableSizes[] = { sizeof(struct mach_header) - 1, fixtureSize - 1 };
+            for (size_t i = 0; i < sizeof(readableSizes) / sizeof(readableSizes[0]); i++) {
+                vm_address_t address = pages + vm_page_size - readableSizes[i];
+                memcpy((void *)address, fixture, fixtureSize);
+                XCTAssertEqual(vm_protect(mach_task_self(), pages + vm_page_size, vm_page_size, false, VM_PROT_NONE),
+                               KERN_SUCCESS);
+                KSBinaryImage image = { 0 };
+                uint8_t uuid[16];
+                XCTAssertFalse(ksbic_copyTaskImage(mach_task_self(), address, &image, uuid));
+                XCTAssertEqual(vm_protect(mach_task_self(), pages + vm_page_size, vm_page_size, false,
+                                          VM_PROT_READ | VM_PROT_WRITE),
+                               KERN_SUCCESS);
+            }
+        }
+    } @finally {
+        XCTAssertEqual(vm_deallocate(mach_task_self(), pages, 2 * vm_page_size), KERN_SUCCESS);
+    }
+}
+
+- (void)testCopyTaskImage_ReturnsFalseForInvalidTask
+{
+    uint8_t fixture[256];
+    populateOwnedImageFixture(fixture, true);
+    KSBinaryImage image = { 0 };
+    uint8_t uuid[16];
+    XCTAssertFalse(ksbic_copyTaskImage(MACH_PORT_NULL, (uintptr_t)fixture, &image, uuid));
+}
+
+- (void)testCopyTaskImage_ReturnsFalseForUnmappedMemory
+{
+    // A page that was mapped and released stands in for an image whose final dlclose already ran.
+    vm_address_t page = 0;
+    XCTAssertEqual(vm_allocate(mach_task_self(), &page, vm_page_size, VM_FLAGS_ANYWHERE), KERN_SUCCESS);
+    XCTAssertEqual(vm_deallocate(mach_task_self(), page, vm_page_size), KERN_SUCCESS);
+
+    KSBinaryImage image = { 0 };
+    uint8_t uuid[16] = { 0 };
+    XCTAssertFalse(ksbic_copyTaskImage(mach_task_self(), (uintptr_t)page, &image, uuid));
 }
 
 @end
