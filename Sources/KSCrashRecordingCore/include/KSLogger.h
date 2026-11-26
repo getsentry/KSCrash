@@ -156,13 +156,15 @@
 
 #include <stdbool.h>
 
+#ifdef __OBJC__
+#import <CoreFoundation/CoreFoundation.h>
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 #ifdef __OBJC__
-
-#import <CoreFoundation/CoreFoundation.h>
 
 void i_kslog_logObjC(const char *level, const char *file, int line, const char *function, CFStringRef fmt, ...);
 
