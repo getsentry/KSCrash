@@ -78,13 +78,17 @@ static id g_cpuObserver = nil;
 
 static id g_powerStateObserver = nil;
 
-#if KSCRASH_HOST_IOS
+#if KSCRASH_HOST_IOS && KSCRASH_HAS_UIDEVICE
 static id g_batteryLevelObserver = nil;
 static id g_batteryStateObserver = nil;
 #endif
 
-#if KSCRASH_HAS_UIAPPLICATION
+// Foundation provides thermal state independently of UIKit on these platforms.
+#define HAS_THERMAL_STATE (KSCRASH_HOST_IOS || KSCRASH_HOST_TV || KSCRASH_HOST_VISION)
+#if HAS_THERMAL_STATE
 static id g_thermalStateObserver = nil;
+#endif
+#if KSCRASH_HAS_UIAPPLICATION
 static id g_protectedDataAvailableObserver = nil;
 static id g_protectedDataUnavailableObserver = nil;
 #endif
@@ -287,7 +291,7 @@ static void stopMemoryObserver(void) { g_memoryObserver = nil; }
 #pragma mark - Battery (iOS only) -
 // ============================================================================
 
-#if KSCRASH_HOST_IOS
+#if KSCRASH_HOST_IOS && KSCRASH_HAS_UIDEVICE
 
 static void readBattery(uint8_t *outLevel, uint8_t *outState)
 {
@@ -366,7 +370,7 @@ static void stopBatteryObservers(void)
 #pragma mark - Thermal / Data Protection (UIApplication) -
 // ============================================================================
 
-#if KSCRASH_HAS_UIAPPLICATION
+#if HAS_THERMAL_STATE
 
 static uint8_t thermalStateToUInt8(NSProcessInfoThermalState state)
 {
@@ -415,6 +419,9 @@ static void stopThermalObserver(void)
     }
 }
 
+#endif  // HAS_THERMAL_STATE
+
+#if KSCRASH_HAS_UIAPPLICATION
 static void startDataProtectionObservers(void)
 {
     uint8_t active = UIApplication.sharedApplication.isProtectedDataAvailable ? 1 : 0;
@@ -595,11 +602,13 @@ static void setEnabled(bool isEnabled, __unused void *context)
         startMemoryObserver();
         startCPUObserver();
         startPowerObserver();
-#if KSCRASH_HOST_IOS
+#if KSCRASH_HOST_IOS && KSCRASH_HAS_UIDEVICE
         startBatteryObservers();
 #endif
-#if KSCRASH_HAS_UIAPPLICATION
+#if HAS_THERMAL_STATE
         startThermalObserver();
+#endif
+#if KSCRASH_HAS_UIAPPLICATION
         startDataProtectionObservers();
 #endif
 
@@ -607,11 +616,13 @@ static void setEnabled(bool isEnabled, __unused void *context)
         stopMemoryObserver();
         stopCPUObserver();
         stopPowerObserver();
-#if KSCRASH_HOST_IOS
+#if KSCRASH_HOST_IOS && KSCRASH_HAS_UIDEVICE
         stopBatteryObservers();
 #endif
-#if KSCRASH_HAS_UIAPPLICATION
+#if HAS_THERMAL_STATE
         stopThermalObserver();
+#endif
+#if KSCRASH_HAS_UIAPPLICATION
         stopDataProtectionObservers();
 #endif
 

@@ -299,6 +299,11 @@ static NSString *getReceiptUrlPath(void)
  */
 static void getDeviceAndAppHashInto(char *dst, size_t dstSize)
 {
+#if KSCRASH_DISABLE_UIKIT && (KSCRASH_HOST_IOS || KSCRASH_HOST_TV || KSCRASH_HOST_VISION)
+    // Without IDFV, do not substitute a hardware address or a non-unique device hash.
+    safeStrlcpy(dst, "", dstSize);
+    return;
+#endif
     NSMutableData *data = nil;
 
 #if KSCRASH_HAS_UIDEVICE
@@ -399,9 +404,14 @@ static void initialize(void)
 #else
 #if KSCRASH_HOST_MAC
     safeStrlcpy(sd->systemName, "macOS", sizeof(sd->systemName));
-#endif
-#if KSCRASH_HOST_WATCH
+#elif KSCRASH_HOST_WATCH
     safeStrlcpy(sd->systemName, "watchOS", sizeof(sd->systemName));
+#elif KSCRASH_HOST_VISION
+    safeStrlcpy(sd->systemName, "visionOS", sizeof(sd->systemName));
+#elif KSCRASH_HOST_TV
+    safeStrlcpy(sd->systemName, "tvOS", sizeof(sd->systemName));
+#elif KSCRASH_HOST_IOS
+    safeStrlcpy(sd->systemName, "iOS", sizeof(sd->systemName));
 #endif
     NSOperatingSystemVersion version = [NSProcessInfo processInfo].operatingSystemVersion;
     NSString *systemVersion;

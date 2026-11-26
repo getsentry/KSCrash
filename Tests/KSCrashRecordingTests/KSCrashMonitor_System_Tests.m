@@ -264,6 +264,11 @@ static bool stubRunSidecarPath(const char *monitorId, char *pathBuffer, size_t p
     XCTAssertNotNil(system[KSCrashField_Machine], @"machine should be populated");
     XCTAssertNotNil(system[KSCrashField_ProcessName], @"processName should be populated");
     XCTAssertNotNil(system[KSCrashField_CPUArch], @"cpuArchitecture should be populated");
+#if KSCRASH_DISABLE_UIKIT && KSCRASH_HOST_IOS
+    XCTAssertEqualObjects(system[KSCrashField_SystemName], @"iOS");
+    XCTAssertGreaterThan([system[KSCrashField_SystemVersion] length], 0U);
+    XCTAssertNil(system[KSCrashField_DeviceAppHash]);
+#endif
 
     NSDictionary *memory = system[KSCrashField_Memory];
     XCTAssertTrue([memory isKindOfClass:[NSDictionary class]]);

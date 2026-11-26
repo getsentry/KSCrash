@@ -44,6 +44,17 @@ dependencies: [
 pod 'KSCrash', '~> 2.6'
 ```
 
+### Building without UIKit (2.6 Sentry backport)
+
+On SwiftPM 6.1 and later, opt into the `NoUIFramework` dependency trait to compile
+KSCrash without UIKit. For native builds set `KSCRASH_DISABLE_UIKIT=1` **when
+compiling KSCrash**, not just in the application target. Default builds are unchanged.
+This does not disable crash monitors, unwinding, or Foundation thermal-state tracking.
+On iOS the opt-out omits the IDFV-derived device hash and does not observe battery,
+protected data or UIKit lifecycle notifications. Foreground/background transitions are
+not available for termination classification. UIKit-based alert and mail presentation
+are unavailable. A package graph resolves a single trait configuration for KSCrash.
+
 ### Setup
 
 ```swift
