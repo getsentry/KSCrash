@@ -64,14 +64,14 @@
 #ifndef HDR_KSCrashHang_h
 #define HDR_KSCrashHang_h
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 #include <CoreFoundation/CoreFoundation.h>
 #include <stdint.h>
 
 #include "KSCrashNamespace.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 /**
  * Describes the type of hang state change being reported to observers.

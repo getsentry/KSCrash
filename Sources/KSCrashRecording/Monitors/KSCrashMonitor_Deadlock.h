@@ -38,15 +38,15 @@
 #ifndef HDR_KSCrashMonitor_Deadlock_h
 #define HDR_KSCrashMonitor_Deadlock_h
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 #include <stdbool.h>
 
 #include "KSCrashMonitorAPI.h"
 #include "KSCrashNamespace.h"
 #include "KSSystemCapabilities.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 /** Set the interval between watchdog checks on the main thread.
  * Default is 5 seconds.

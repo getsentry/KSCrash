@@ -65,15 +65,15 @@
 #ifndef HDR_KSCrashMonitor_Watchdog_h
 #define HDR_KSCrashMonitor_Watchdog_h
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 #include <stdbool.h>
 
 #include "KSCrashHang.h"
 #include "KSCrashMonitorAPI.h"
 #include "KSCrashNamespace.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 /** Access the Monitor API.
  */
